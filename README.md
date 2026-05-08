@@ -134,21 +134,6 @@ Each sample is conditioned on a 5-dimensional vector:
 
 ---
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@mastersthesis{varecka2026gcims,
-  author  = {Marek Varečka},
-  title   = {GC-IMS Spectra Generation using Generative Adversarial Networks},
-  school  = {[Your University]},
-  year    = {2026}
-}
-```
-
----
-
 ## License
 
 See [LICENSE](LICENSE) for details.
