@@ -1,30 +1,3 @@
-"""
-GANpreprocess.py
-================
-Preprocessing pipeline for raw GC-IMS ``.mea`` spectra.
-
-Reads raw measurement files via :func:`~meaLoader.load_mea_files`, applies a
-multi-step signal processing pipeline to each spectrum, and writes the results
-to a compressed HDF5 cache file ready for GAN training.
-
-Pipeline steps (Christmann et al. 2024 / Kirtsanis et al. 2025)
-----------------------------------------------------------------
-1. RIP-relative drift-time alignment — ``spec.riprel()``
-2. Wavelet compression — ``spec.wavecompr(wavelet="db3", level=3)``
-3. Retention-time resampling — ``spec.resample(7)``
-4. Top-hat baseline correction — ``spec.tophat(size=15)``
-5. Drift-time cropping — removes RIP, keeps analyte zone ``[1.05, 2.10]`` ms
-6. Retention-time cropping — keeps VOC elution window ``[70, 780]`` s
-7. Drift-time interpolation — resamples to a fixed width of 128 points
-8. RIP-based normalisation — scales intensities to ``[0, 1]``
-
-Usage
------
-.. code-block:: bash
-
-    python GANpreprocess.py --root /data/IMS --cache ims_cache.h5
-"""
-
 import re
 import argparse
 import h5py
@@ -38,31 +11,22 @@ from meaLoader import load_mea_files
 
 # ── Organism registry ─────────────────────────────────────────────────────────
 ORGANISMS = ["lb", "ec", "sc", "pf"]
-"""List of known organism codes used for multi-hot encoding."""
-
 MAX_HOURS = 8
-"""Maximum fermentation duration in hours."""
-
 COND_DIM  = len(ORGANISMS) + 1   # 4 organism flags + 1 normalized time
-"""Condition vector dimensionality: 4 organism flags + 1 normalised time."""
+
 
 def parse_organisms(name: str):
     """
-    Extract organism codes from a file or folder name.
-
-    Normalises the name to lowercase with underscores, then checks for
-    membership of each code in :data:`ORGANISMS`.
+    Finds organisms in a filename
 
     Parameters
-    ----------
+    ---
     name : str
-        Full file path or folder name to inspect.
+        Full path
 
     Returns
-    -------
-    list of str
-        Organism codes found in *name* (e.g. ``["lb", "ec"]``).
-        Returns an empty list if no known code is found.
+    ---
+    List of organism codes found in the name (e.g. ["lb", "ec"])
     """
     s = name.lower().replace("-", "_").replace(" ", "_")
     found = []
@@ -73,24 +37,16 @@ def parse_organisms(name: str):
 
 def organisms_to_multihot(org_list):
     """
-    Convert a list of organism codes to a multi-hot indicator vector.
+    Converts a list of organism codes (e.g. ["lb", "ec"]) to a multi-hot vector based on the ORGANISMS registry.
+    e.g. ["lb", "ec"] -> [1, 1, 0, 0]
 
     Parameters
-    ----------
-    org_list : list of str
-        Organism codes to encode (e.g. ``["lb", "ec"]``).
+    ---
+    org_list : List of organism codes (e.g. ["lb", "ec"])
 
     Returns
-    -------
-    numpy.ndarray
-        Float32 array of shape ``(len(ORGANISMS),)`` with ``1.0`` at each
-        index corresponding to a present organism and ``0.0`` elsewhere
-        (e.g. ``[1., 1., 0., 0.]``).
-
-    Examples
-    --------
-    >>> organisms_to_multihot(["lb", "sc"])
-    array([1., 0., 1., 0.], dtype=float32)
+    ---
+    Numpy array multi-hot vector (e.g. [1, 1, 0, 0])
     """
     vec = np.zeros(len(ORGANISMS), dtype=np.float32)
     for o in org_list:
@@ -100,20 +56,7 @@ def organisms_to_multihot(org_list):
 
 def parse_hour_from_filename(stem: str):
     """
-    Extract the fermentation hour from a filename stem.
-
-    Looks for a pattern of the form ``t<digit>_`` (e.g. ``t0_``, ``t6_``).
-
-    Parameters
-    ----------
-    stem : str
-        Filename stem (without extension) to parse.
-
-    Returns
-    -------
-    int or None
-        Parsed hour in the range ``[0, MAX_HOURS]``, or ``None`` if the
-        pattern is not found or the value is out of range.
+    Returns the hour of fermentation based on the t_[hour] in path, e.g. t0_, t1_, ..., t6_
     """
     s = stem.lower()
     time = re.search(r"t\d_", s)
@@ -127,24 +70,15 @@ def parse_hour_from_filename(stem: str):
 
 def parse_batch_number(folder_name: str):
     """
-    Extract the batch number from a folder name.
-
-    Searches for a pattern such as ``Batch_1`` or ``batch-2`` (case-insensitive).
+    Extracts batch number from folder name, e.g. "210429_EC_Batch_1" -> 1.
 
     Parameters
     ----------
     folder_name : str
-        Name of the folder to parse (e.g. ``"210429_EC_Batch_1"``).
 
     Returns
     -------
-    int
-        Parsed batch number, or ``1`` if the pattern is not found.
-
-    Examples
-    --------
-    >>> parse_batch_number("210429_EC_Batch_3")
-    3
+    int, defaults to 1 if not found
     """
     match = re.search(r"batch[_\-\s]?(\d+)", folder_name.lower())
     if match:
@@ -153,33 +87,8 @@ def parse_batch_number(folder_name: str):
 
 def scan_dataset(root: str):
     """
-    Scan a dataset directory and parse metadata from file paths.
-
-    Calls :func:`~meaLoader.load_mea_files` to obtain a flat list of
-    ``.mea`` paths, then parses the organism labels, batch number, and
-    fermentation hour for each file.
-
-    Parameters
-    ----------
-    root : str
-        Root directory passed to :func:`~meaLoader.load_mea_files`.
-
-    Returns
-    -------
-    list of dict
-        One record per ``.mea`` file with the following keys:
-
-        - ``"path"`` : str — absolute file path.
-        - ``"org_vec"`` : numpy.ndarray — multi-hot organism vector.
-        - ``"batch_id"`` : str — unique batch identifier string.
-        - ``"batch_number"`` : int — numeric batch index.
-        - ``"culture_type"`` : ``"pure"`` or ``"mixed"``.
-        - ``"hour"`` : int — fermentation hour (``0`` if not parseable).
-
-    Warns
-    -----
-    Prints a warning to stdout for any file whose organisms or hour cannot
-    be parsed.
+    Calls load_mea_files(root) which returns a flat list of .mea path strings.
+    Parses organism labels, batch number and fermentation hour from each path.
     """
     path_list = load_mea_files(root)
 
@@ -231,31 +140,6 @@ def scan_dataset(root: str):
     return records
 
 def build_cache(args):
-    """
-    Preprocess all spectra and write them to an HDF5 cache file.
-
-    Scans *args.root* for ``.mea`` files, applies :func:`preprocess` to each
-    spectrum, and stores the results together with metadata in an HDF5 file at
-    *args.cache*.  Global statistics (``log_mean``, ``log_std``) computed over
-    the log-transformed intensities are stored as root-level attributes for
-    use during GAN training normalisation.
-
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Parsed command-line arguments.  Expected attributes:
-
-        - ``root`` (str) — dataset root directory.
-        - ``cache`` (str) — output HDF5 path.
-        - ``dt_start``, ``dt_stop`` (float) — drift-time crop bounds.
-        - ``rt_start``, ``rt_stop`` (float) — retention-time crop bounds.
-
-    Raises
-    ------
-    RuntimeError
-        If no records are found in *args.root*, or if all files fail to
-        preprocess.
-    """
     records = scan_dataset(args.root)
 
     if not records:
@@ -347,24 +231,8 @@ def build_cache(args):
 
 def interpolate_to_fixed_width(spec, n_drift: int = 1024):
     """
-    Resample the drift-time axis to exactly *n_drift* points.
-
-    Uses linear interpolation via :func:`scipy.interpolate.interp1d`.
-    Must be called **before** any compression step that changes the spectral
-    width.
-
-    Parameters
-    ----------
-    spec : ims.Spectrum
-        Spectrum object whose ``values`` array has shape ``(n_ret, n_drift_orig)``.
-    n_drift : int, optional
-        Target number of drift-time points. Default is ``1024``.
-
-    Returns
-    -------
-    ims.Spectrum
-        The same spectrum object with ``values`` and ``drift_time`` resampled
-        to *n_drift* columns.
+    Resample drift time axis to exactly n_drift points via linear interpolation.
+    Must be called BEFORE any compression that changes the width.
     """
     from scipy.interpolate import interp1d
 
@@ -375,6 +243,18 @@ def interpolate_to_fixed_width(spec, n_drift: int = 1024):
     spec.drift_time = np.interp(new_x, old_x, spec.drift_time)
     return spec
 
+
+
+# ── Core preprocessing pipeline ──────────────────────────────────────────────
+#
+#  Based on Christmann et al. 2024 / Kirtsanis et al. 2025:
+#   1. Wavelet compression (db3, level=3)
+#   2. Top-hat baseline correction (size=15)
+#   3. RIP-relative drift time alignment
+#   4. Cut drift time  [1.05, 2.10]  — removes RIP, keeps analyte zone
+#   5. Cut retention time [70, 780] s — keeps VOC elution window
+#   6. Normalize [0, 1]
+
 def preprocess(
     spectrum,
     tophat_sz: int   = 15,
@@ -382,49 +262,6 @@ def preprocess(
     dt_stop:   float = 2.10,
     rt_start:  float = 70.0,
     rt_stop:   float = 780.0):
-    """
-    Apply the full preprocessing pipeline to a single GC-IMS spectrum.
-
-    Executes the following steps in order:
-
-    1. **RIP-relative alignment** — aligns drift-time axis relative to the
-       reactant ion peak (RIP) position.
-    2. **Wavelet compression** — denoises and compresses along the drift-time
-       axis using a Daubechies-3 (``db3``) wavelet at level 3.
-    3. **Retention-time resampling** — reduces the number of retention-time
-       rows by a factor of 7.
-    4. **Top-hat baseline correction** — suppresses slowly varying background
-       drift with a structuring element of size *tophat_sz*.
-    5. **Drift-time cropping** — retains only ``[dt_start, dt_stop]`` ms,
-       removing the RIP and pre-RIP region.
-    6. **Retention-time cropping** — retains only ``[rt_start, rt_stop]`` s,
-       covering the VOC elution window.
-    7. **Fixed-width interpolation** — resamples to 128 drift-time points.
-    8. **Normalisation** — scales all values to ``[0, 1]`` using the original
-       RIP maximum intensity.
-
-    Parameters
-    ----------
-    spectrum : ims.Spectrum
-        Raw GC-IMS spectrum loaded from a ``.mea`` file.
-    tophat_sz : int, optional
-        Structuring element size for morphological top-hat correction.
-        Default is ``15``.
-    dt_start : float, optional
-        Lower bound for drift-time cropping in milliseconds. Default is ``1.05``.
-    dt_stop : float, optional
-        Upper bound for drift-time cropping in milliseconds. Default is ``2.10``.
-    rt_start : float, optional
-        Lower bound for retention-time cropping in seconds. Default is ``70.0``.
-    rt_stop : float, optional
-        Upper bound for retention-time cropping in seconds. Default is ``780.0``.
-
-    Returns
-    -------
-    ims.Spectrum
-        Preprocessed spectrum with ``values`` of shape ``(n_ret, 128)``
-        normalised to ``[0, 1]``.
-    """
 
     spec = spectrum.copy()
 

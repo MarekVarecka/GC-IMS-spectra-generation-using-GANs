@@ -1,47 +1,53 @@
 """
-Z_make_synthetic.py
-===================
+Z_make_synthetic_cache.py
+=========================
 Generate synthetic GC-IMS spectra from a trained GAN checkpoint and write
-them to an HDF5 cache that is format-compatible with the real ``ims_cache.h5``.
+them to an HDF5 cache that is format-compatible with the real ims_cache.h5.
 
 Supports all four model variants and both culture types:
-
-- **Pure** — single organism, one-hot ``org_vec``, e.g. ``[1, 0, 0, 0]``.
-- **Mixed** — two organisms, multi-hot ``org_vec``, e.g. ``[1, 1, 0, 0]``
-  (all :math:`\binom{4}{2} = 6` pairs).
+  Pure    — single organism, one-hot org_vec  e.g. [1,0,0,0]
+  Mixed   — multiple organisms, multi-hot     e.g. [1,1,0,0]  (pairs only, C(4,2)=6)
 
 GAN variants
 ------------
-``cwgan_gp``
-    Conditional WGAN + Gradient Penalty (default).
-``cwgan``
-    Conditional WGAN + Weight Clipping.
-``cgan``
-    Conditional GAN + BCE loss.
-``wgan_gp``
-    Unconditional WGAN + Gradient Penalty.
+    cwgan_gp  — Conditional WGAN + Gradient Penalty  (default)
+    cwgan     — Conditional WGAN + Weight Clipping
+    cgan      — Conditional GAN  + BCE loss
+    wgan_gp   — Unconditional WGAN + Gradient Penalty
 
 Usage examples
 --------------
-.. code-block:: bash
+# Pure cultures only (default):
+python Z_make_synthetic_cache.py \
+    --checkpoint checkpoints/cwgan_gp_final.pt --model cwgan_gp
 
-    # Pure cultures only (default):
-    python Z_make_synthetic.py \\
-        --checkpoint checkpoints/cwgan_gp_final.pt --model cwgan_gp
+# Include mixed cultures (all 2-org pairs + all 3-org triples):
+python Z_make_synthetic_cache.py \
+    --checkpoint checkpoints/cwgan_gp_final.pt --model cwgan_gp \
+    --mixed
 
-    # Include mixed cultures (all 6 two-organism pairs):
-    python Z_make_synthetic.py \\
-        --checkpoint checkpoints/cwgan_gp_final.pt --model cwgan_gp --mixed
+# Mixed cultures only (skip pure single-organism conditions):
+python Z_make_synthetic_cache.py \
+    --checkpoint checkpoints/cwgan_gp_final.pt --model cwgan_gp \
+    --mixed --no-pure
 
-    # Mixed cultures only:
-    python Z_make_synthetic.py \\
-        --checkpoint checkpoints/cwgan_gp_final.pt --model cwgan_gp \\
-        --mixed --no-pure
+# Specify output path and generation parameters:
+python Z_make_synthetic_cache.py \
+    --checkpoint checkpoints/cgan_final.pt --model cgan \
+    --output synthetic_cgan.h5 --n-per-cond 50 --mixed
 
-    # Custom output path and sample count:
-    python Z_make_synthetic.py \\
-        --checkpoint checkpoints/cgan_final.pt --model cgan \\
-        --output synthetic_cgan.h5 --n-per-cond 50 --mixed
+All arguments
+-------------
+  --checkpoint    PATH   Path to the generator checkpoint (.pt)        [required]
+  --model         STR    GAN variant: cwgan_gp | cwgan | cgan | wgan_gp [required]
+  --output        PATH   Output HDF5 path  (default: synthetic_<model>.h5)
+  --real-cache    PATH   Real HDF5 cache to borrow rettime/drifttime    [default: ims_cache.h5]
+  --n-per-cond    INT    Samples per condition cell                     [default: 20]
+  --max-hours     INT    Fermentation time steps  0 … N-1              [default: 8]
+  --mixed                Also generate mixed-culture conditions (multi-hot org_vec)
+  --no-pure              Skip pure single-organism conditions (only valid with --mixed)
+  --device        STR    "cuda" | "cpu" | "auto"                       [default: auto]
+  --seed          INT    RNG seed                                       [default: 42]
 """
 
 import argparse
@@ -59,39 +65,16 @@ from IMS_models import Generator
 # ── Constants ────────────────────────────────────────────────────────────────
 
 ORGANISMS = ["lb", "ec", "sc", "pf"]
-"""Known organism codes in fixed index order."""
+COND_DIM  = 5   # [lb, ec, sc, pf, time_norm]
 
-COND_DIM = 5
-"""Condition vector dimensionality: ``[lb, ec, sc, pf, time_norm]``."""
-
-CONDITIONAL_MODELS   = {"cwgan_gp", "cwgan", "cgan"}
-"""Set of model variants that accept a condition vector."""
-
+CONDITIONAL_MODELS  = {"cwgan_gp", "cwgan", "cgan"}
 UNCONDITIONAL_MODELS = {"wgan_gp"}
-"""Set of model variants that ignore the condition vector."""
-
 ALL_MODELS = CONDITIONAL_MODELS | UNCONDITIONAL_MODELS
-"""Union of all supported model variant identifiers."""
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    """
-    Parse and validate command-line arguments.
-
-    Returns
-    -------
-    argparse.Namespace
-        Parsed arguments with attributes: ``checkpoint``, ``model``,
-        ``output``, ``real_cache``, ``n_per_cond``, ``max_hours``,
-        ``mixed``, ``no_pure``, ``device``, ``seed``.
-
-    Raises
-    ------
-    SystemExit
-        If ``--no-pure`` is used without ``--mixed``.
-    """
     parser = argparse.ArgumentParser(
         prog="Z_make_synthetic_cache.py",
         description="Generate synthetic GC-IMS spectra (pure + optional mixed cultures).",
@@ -141,34 +124,15 @@ def build_conditions(
     max_hours: int,
 ) -> list[tuple[np.ndarray, str]]:
     """
-    Build a list of ``(org_vec, label)`` tuples for all requested culture types.
+    Build a list of (org_vec, label_str) tuples covering every requested
+    culture type x time step combination.
 
-    Generates one entry per unique organism combination; hours are handled
-    separately inside :func:`generate`.
+    Pure   : one-hot org_vec,   label = organism name  e.g. "lb"
+    Mixed  : multi-hot org_vec, label = sorted names   e.g. "ec+lb"
+             Includes all 2-organism pairs  (C(4,2) = 6)
 
-    Parameters
-    ----------
-    include_pure : bool
-        If ``True``, include one-hot single-organism conditions.
-    include_mixed : bool
-        If ``True``, include all :math:`\binom{4}{2} = 6` two-organism
-        multi-hot conditions.
-    max_hours : int
-        Not used directly; kept for API symmetry with the generation loop.
-
-    Returns
-    -------
-    list of tuple
-        Each element is ``(org_vec, culture_label)`` where:
-
-        - ``org_vec`` : :class:`numpy.ndarray` of shape ``(4,)``, ``float32``.
-        - ``culture_label`` : ``str``, e.g. ``"lb"`` (pure) or ``"ec+lb"`` (mixed).
-
-    Examples
-    --------
-    >>> conds = build_conditions(include_pure=True, include_mixed=False, max_hours=8)
-    >>> [label for _, label in conds]
-    ['lb', 'ec', 'sc', 'pf']
+    Returns list of (org_vec: float32 (4,), culture_label: str)
+    — one entry per unique organism combination (hours handled separately).
     """
     conditions = []
 
@@ -187,25 +151,15 @@ def build_conditions(
             label = "+".join(sorted(ORGANISMS[i] for i in combo))
             conditions.append((vec, label))
 
+        # Note: 3-organism and 4-organism combinations are not used
+        # (dataset only contains pure single-organism and 2-organism mixed cultures)
+
     return conditions
 
 
 # ── Generator loading ─────────────────────────────────────────────────────────
 
 def resolve_device(choice: str) -> torch.device:
-    """
-    Resolve the target compute device.
-
-    Parameters
-    ----------
-    choice : {"auto", "cuda", "cpu"}
-        Device selection string.  ``"auto"`` picks CUDA if available.
-
-    Returns
-    -------
-    torch.device
-        Resolved device object.
-    """
     if choice == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(choice)
@@ -213,21 +167,9 @@ def resolve_device(choice: str) -> torch.device:
 
 def load_generator(checkpoint: str, device: torch.device) -> Generator:
     """
-    Restore a :class:`~IMS_models.Generator` from a checkpoint file.
-
-    Parameters
-    ----------
-    checkpoint : str
-        Path to the ``.pt`` checkpoint file saved by :mod:`IMS_train_models`.
-        Required keys: ``G_state``, ``img_h``, ``img_w``.
-        Optional keys: ``cond_dim`` (default ``5``), ``z_dim`` (default ``128``).
-    device : torch.device
-        Target device for the loaded model.
-
-    Returns
-    -------
-    Generator
-        Generator in evaluation mode (``model.eval()`` called).
+    Restore a Generator from a checkpoint dict.
+    Required keys: G_state, img_h, img_w
+    Optional keys: cond_dim, z_dim
     """
     ckpt     = torch.load(checkpoint, map_location=device)
     img_h    = int(ckpt["img_h"])
@@ -243,24 +185,6 @@ def load_generator(checkpoint: str, device: torch.device) -> Generator:
 
 
 def get_reference_axes(real_cache: str) -> tuple:
-    """
-    Read retention-time and drift-time axes from the real HDF5 cache.
-
-    These axes are copied verbatim into the synthetic cache so that the two
-    datasets remain axis-aligned for downstream comparison.
-
-    Parameters
-    ----------
-    real_cache : str
-        Path to the real ``ims_cache.h5`` file.
-
-    Returns
-    -------
-    rettime : numpy.ndarray
-        Retention-time axis array from the first sample in the cache.
-    drifttime : numpy.ndarray
-        Drift-time axis array from the first sample in the cache.
-    """
     with h5py.File(real_cache, "r") as hf:
         k = sorted(hf.keys())[0]
         return hf[k]["rettime"][:], hf[k]["drifttime"][:]
@@ -270,33 +194,6 @@ def get_reference_axes(real_cache: str) -> tuple:
 
 def _write_sample(hf, count, arr, rettime, drifttime,
                   org_vec, culture_label, hour, time_norm, replica):
-    """
-    Write a single synthetic spectrum into an open HDF5 file.
-
-    Parameters
-    ----------
-    hf : h5py.File
-        Open HDF5 file object in write mode.
-    count : int
-        Global sample counter used to generate the group key
-        (``sample_NNNN``).
-    arr : numpy.ndarray
-        Spectrum values array of shape ``(H, W)``.
-    rettime : numpy.ndarray
-        Retention-time axis to store alongside the spectrum.
-    drifttime : numpy.ndarray
-        Drift-time axis to store alongside the spectrum.
-    org_vec : numpy.ndarray
-        Multi-hot organism vector of shape ``(4,)``.
-    culture_label : str
-        Human-readable culture label (e.g. ``"lb"`` or ``"ec+lb"``).
-    hour : int
-        Fermentation hour index.
-    time_norm : float
-        Normalised fermentation time ``hour / (max_hours - 1)``.
-    replica : int
-        Zero-based replica index within this ``(condition, hour)`` cell.
-    """
     key = f"sample_{count:04d}"
     grp = hf.create_group(key)
     grp.create_dataset("values",    data=arr.astype(np.float32), compression="lzf")
@@ -317,40 +214,8 @@ def _write_sample(hf, count, arr, rettime, drifttime,
 def generate(G, hf_out, rettime, drifttime, conditions, max_hours,
              n_per_cond, device, unconditional=False) -> int:
     """
-    Iterate over all ``(condition × hour)`` cells and write spectra to HDF5.
-
-    For conditional models the full condition vector ``[org_vec | time_norm]``
-    is fed to the generator.  For unconditional models (``wgan_gp``) only a
-    noise vector is fed; the organism metadata is still written as HDF5
-    attributes for bookkeeping.
-
-    Parameters
-    ----------
-    G : Generator
-        Generator network in evaluation mode.
-    hf_out : h5py.File
-        Open HDF5 file in write mode.
-    rettime : numpy.ndarray
-        Retention-time axis copied from the real cache.
-    drifttime : numpy.ndarray
-        Drift-time axis copied from the real cache.
-    conditions : list of tuple
-        Output of :func:`build_conditions` —
-        ``[(org_vec, culture_label), ...]``.
-    max_hours : int
-        Number of fermentation time steps (``0`` to ``max_hours - 1``).
-    n_per_cond : int
-        Number of synthetic spectra generated per ``(condition, hour)`` cell.
-    device : torch.device
-        Compute device.
-    unconditional : bool, optional
-        If ``True``, no condition vector is passed to the generator.
-        Default is ``False``.
-
-    Returns
-    -------
-    int
-        Total number of spectra written to *hf_out*.
+    Iterate over all (condition x hour) cells and write spectra.
+    Returns total number of samples written.
     """
     count = 0
     with torch.no_grad():
@@ -386,14 +251,6 @@ def generate(G, hf_out, rettime, drifttime, conditions, max_hours,
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """
-    Entry point: parse arguments, load the generator, and write the synthetic cache.
-
-    Reads the trained generator checkpoint, constructs all requested
-    condition combinations, generates *n_per_cond* spectra per
-    ``(condition, hour)`` cell, and saves everything to an HDF5 file whose
-    structure mirrors the real ``ims_cache.h5``.
-    """
     args = parse_args()
 
     out_path = args.output or f"synthetic_{args.model}.h5"

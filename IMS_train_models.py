@@ -1,37 +1,24 @@
 """
-IMS_train_models.py
-===================
+IMS_train.py
+============
 Unified training script for all four GAN ablation variants.
-
-Each variant shares the same :class:`~IMS_models.Generator` and
-:class:`~IMS_models.Critic` architecture but differs in its loss function
-and Lipschitz enforcement strategy.
-
-Model variants
---------------
-``cwgan_gp``
-    Conditional WGAN with Gradient Penalty — the primary model.
-    Wasserstein loss + GP term (Gulrajani et al., 2017).
-``cwgan``
-    Conditional WGAN with weight clipping (Arjovsky et al., 2017).
-    No gradient penalty.
-``cgan``
-    Conditional GAN with BCE loss (Mirza & Osindero, 2014).
-    No Wasserstein distance.
-``wgan_gp``
-    Unconditional WGAN-GP.  Condition vector is ignored in both G and D.
 
 Usage
 -----
-.. code-block:: bash
+  python IMS_train.py --model cwgan_gp  --cache ims_cache.h5  [options]
+  python IMS_train.py --model cwgan     --cache ims_cache.h5  [options]
+  python IMS_train.py --model cgan      --cache ims_cache.h5  [options]
+  python IMS_train.py --model wgan_gp   --cache ims_cache.h5  [options]
 
-    python IMS_train_models.py --model cwgan_gp --cache ims_cache.h5
-    python IMS_train_models.py --model cwgan    --cache ims_cache.h5
-    python IMS_train_models.py --model cgan     --cache ims_cache.h5
-    python IMS_train_models.py --model wgan_gp  --cache ims_cache.h5
+Model variants
+--------------
+  cwgan_gp   Conditional WGAN-GP          (full model — your thesis main model)
+  cwgan      Conditional WGAN             (no gradient penalty, weight clipping)
+  cgan       Conditional GAN              (BCE loss, no Wasserstein distance)
+  wgan_gp    Unconditional WGAN-GP        (no conditioning)
 
-Checkpoints are saved to ``<out_dir>/<model_name>/checkpoint_<epoch>.pt``.
-The final generator weights are exported as ``generator_final.pt``.
+Checkpoints are saved to  --out_dir / {model_name} /
+Final generator is saved as  generator_final.pt
 """
 
 import argparse
@@ -51,47 +38,14 @@ from IMS_models import Generator, Critic, gradient_penalty
 # ── Model registry ────────────────────────────────────────────────────────────
 
 MODELS = ["cwgan_gp", "cwgan", "cgan", "wgan_gp"]
-"""List of supported GAN variant identifiers."""
 
-CLIP_VALUE = 0.01
-"""Weight clipping bound used by the ``cwgan`` variant."""
+CLIP_VALUE = 0.01   # weight clipping bound for cwgan
 
 
 # ── Training functions ────────────────────────────────────────────────────────
 
 def train_step_cwgan_gp(G, D, opt_G, opt_D, real, cond, args, device):
-    """
-    Single training step for the Conditional WGAN-GP variant.
-
-    Runs *n_critic* critic updates (Wasserstein loss + gradient penalty)
-    followed by one generator update.
-
-    Parameters
-    ----------
-    G : Generator
-        Generator network.
-    D : Critic
-        Critic network.
-    opt_G : torch.optim.Optimizer
-        Generator optimiser.
-    opt_D : torch.optim.Optimizer
-        Critic optimiser.
-    real : torch.Tensor
-        Real spectra batch of shape ``(B, 1, H, W)``.
-    cond : torch.Tensor
-        Condition vectors of shape ``(B, cond_dim)``.
-    args : argparse.Namespace
-        Training configuration (``n_critic``, ``gp_lambda``).
-    device : torch.device
-        Target compute device.
-
-    Returns
-    -------
-    loss_D : float
-        Mean critic loss over *n_critic* updates.
-    loss_G : float
-        Generator loss for this step.
-    """
+    """Conditional WGAN-GP: Wasserstein loss + gradient penalty."""
     B = real.size(0)
     loss_D_val = 0.0
 
@@ -121,38 +75,7 @@ def train_step_cwgan_gp(G, D, opt_G, opt_D, real, cond, args, device):
 
 
 def train_step_cwgan(G, D, opt_G, opt_D, real, cond, args, device):
-    """
-    Single training step for the Conditional WGAN (weight clipping) variant.
-
-    Runs *n_critic* critic updates with Wasserstein loss and enforces the
-    Lipschitz constraint via weight clipping to ``±CLIP_VALUE``.
-
-    Parameters
-    ----------
-    G : Generator
-        Generator network.
-    D : Critic
-        Critic network.
-    opt_G : torch.optim.Optimizer
-        Generator optimiser.
-    opt_D : torch.optim.Optimizer
-        Critic optimiser.
-    real : torch.Tensor
-        Real spectra batch of shape ``(B, 1, H, W)``.
-    cond : torch.Tensor
-        Condition vectors of shape ``(B, cond_dim)``.
-    args : argparse.Namespace
-        Training configuration (``n_critic``).
-    device : torch.device
-        Target compute device.
-
-    Returns
-    -------
-    loss_D : float
-        Mean critic loss over *n_critic* updates.
-    loss_G : float
-        Generator loss for this step.
-    """
+    """Conditional WGAN: Wasserstein loss + weight clipping (no GP)."""
     B = real.size(0)
     loss_D_val = 0.0
 
@@ -185,38 +108,7 @@ def train_step_cwgan(G, D, opt_G, opt_D, real, cond, args, device):
 
 
 def train_step_cgan(G, D, opt_G, opt_D, real, cond, args, device):
-    """
-    Single training step for the Conditional GAN (BCE loss) variant.
-
-    Uses a single critic update followed by a single generator update,
-    both with Binary Cross-Entropy loss.
-
-    Parameters
-    ----------
-    G : Generator
-        Generator network.
-    D : Critic
-        Discriminator network (produces logits interpreted via BCE).
-    opt_G : torch.optim.Optimizer
-        Generator optimiser.
-    opt_D : torch.optim.Optimizer
-        Discriminator optimiser.
-    real : torch.Tensor
-        Real spectra batch of shape ``(B, 1, H, W)``.
-    cond : torch.Tensor
-        Condition vectors of shape ``(B, cond_dim)``.
-    args : argparse.Namespace
-        Training configuration (unused for cGAN beyond ``batch_size``).
-    device : torch.device
-        Target compute device.
-
-    Returns
-    -------
-    loss_D : float
-        Discriminator loss.
-    loss_G : float
-        Generator loss.
-    """
+    """Conditional GAN: BCE loss (no Wasserstein distance)."""
     B       = real.size(0)
     ones    = torch.ones (B, device=device)
     zeros   = torch.zeros(B, device=device)
@@ -246,38 +138,7 @@ def train_step_cgan(G, D, opt_G, opt_D, real, cond, args, device):
 
 
 def train_step_wgan_gp(G, D, opt_G, opt_D, real, cond, args, device):
-    """
-    Single training step for the Unconditional WGAN-GP variant.
-
-    Identical to :func:`train_step_cwgan_gp` except the condition vector is
-    never passed to the generator or critic.
-
-    Parameters
-    ----------
-    G : Generator
-        Generator network (``cond_dim=0``).
-    D : Critic
-        Critic network (``cond_dim=0``).
-    opt_G : torch.optim.Optimizer
-        Generator optimiser.
-    opt_D : torch.optim.Optimizer
-        Critic optimiser.
-    real : torch.Tensor
-        Real spectra batch of shape ``(B, 1, H, W)``.
-    cond : torch.Tensor
-        Condition vectors — passed in but **not used** by this variant.
-    args : argparse.Namespace
-        Training configuration (``n_critic``, ``gp_lambda``).
-    device : torch.device
-        Target compute device.
-
-    Returns
-    -------
-    loss_D : float
-        Mean critic loss over *n_critic* updates.
-    loss_G : float
-        Generator loss for this step.
-    """
+    """Unconditional WGAN-GP: cond is ignored in G and D."""
     B = real.size(0)
     loss_D_val = 0.0
 
@@ -312,36 +173,11 @@ TRAIN_STEP = {
     "cgan":     train_step_cgan,
     "wgan_gp":  train_step_wgan_gp,
 }
-"""Dispatch table mapping model variant names to their training step functions."""
+
 
 # ── Main training loop ────────────────────────────────────────────────────────
 
 def train(args):
-    """
-    Execute the full training loop for the selected GAN variant.
-
-    Loads the dataset, constructs the generator and critic, runs the training
-    loop for ``args.epochs`` epochs, saves periodic checkpoints, and exports
-    the final generator weights.
-
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Parsed command-line arguments.  Expected attributes:
-
-        - ``model`` (str) — GAN variant name, one of :data:`MODELS`.
-        - ``cache`` (str) — path to the HDF5 training cache.
-        - ``val_batch`` (int) — batch number held out for validation.
-        - ``epochs`` (int) — total number of training epochs.
-        - ``batch_size`` (int) — mini-batch size.
-        - ``z_dim`` (int) — generator noise dimensionality.
-        - ``lr`` (float) — base learning rate for Adam.
-        - ``n_critic`` (int) — critic update steps per generator step.
-        - ``gp_lambda`` (float) — gradient penalty coefficient.
-        - ``out_dir`` (str) — root directory for checkpoints.
-        - ``save_every`` (int) — checkpoint save interval in epochs.
-        - ``resume`` (str or None) — path to a checkpoint to resume from.
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Model    : {args.model}")
     print(f"Device   : {device}")
